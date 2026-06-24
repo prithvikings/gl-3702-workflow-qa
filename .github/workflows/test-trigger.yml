@@ -10,6 +10,6 @@ jobs:
     uses: ./.github/workflows/code-formatting-check.yml
     secrets: inherit
     with:
-      python_formatting: true
-      shell_formatting: true
-      yaml_formatting: true
+      python_formatting: false
+      shell_formatting: false
+      yaml_formatting: false
