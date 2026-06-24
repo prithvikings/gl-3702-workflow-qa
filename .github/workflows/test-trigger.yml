@@ -1,0 +1,15 @@
+name: Test Trigger
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-format:
+    uses: ./.github/workflows/code-formatting-check.yml
+    secrets: inherit
+    with:
+      python_formatting: true
+      shell_formatting: true
+      yaml_formatting: true

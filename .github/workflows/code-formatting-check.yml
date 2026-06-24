@@ -1,0 +1,800 @@
+name: Code Formatting Check
+
+on:
+  workflow_call:
+    inputs:
+      # Common formatting options
+      ignore_patterns:
+        description: "Space-separated list of glob patterns to ignore when formatting"
+        required: false
+        type: string
+        default: ""
+      # Python formatting options
+      python_formatting:
+        description: "Whether to run Python formatting"
+        required: false
+        type: boolean
+        default: true
+      python_version:
+        description: "Python version to use"
+        required: false
+        type: string
+        default: "3.10"
+      # Shell script formatting options
+      shell_formatting:
+        description: "Whether to run shell script formatting"
+        required: false
+        type: boolean
+        default: true
+      shell_version:
+        description: "ShellCheck version to use"
+        required: false
+        type: string
+        default: "0.10.0"
+      shfmt_version:
+        description: "shfmt version to use"
+        required: false
+        type: string
+        default: "3.11.0"
+      # YAML formatting options
+      yaml_formatting:
+        description: "Whether to run YAML formatting"
+        required: false
+        type: boolean
+        default: true
+      yamlfmt_version:
+        description: "yamlfmt version to use"
+        required: false
+        type: string
+        default: "0.16.0"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      languages: ${{ steps.setup-languages.outputs.languages }}
+    steps:
+      - name: Set up languages to format
+        id: setup-languages
+        run: |
+          # Determine which languages to format
+          LANGUAGES="[]"
+
+          # Setting the supported languages
+          if [ "${{ inputs.python_formatting }}" == "true" ]; then
+            LANGUAGES=$(echo $LANGUAGES | jq -c '. += ["python"]')
+          fi
+
+          if [ "${{ inputs.shell_formatting }}" == "true" ]; then
+            LANGUAGES=$(echo $LANGUAGES | jq -c '. += ["shell"]')
+          fi
+
+          if [ "${{ inputs.yaml_formatting }}" == "true" ]; then
+            LANGUAGES=$(echo $LANGUAGES | jq -c '. += ["yaml"]')
+          fi
+
+          # If no specific language is enabled, skip the formatting
+          if [ "$LANGUAGES" == "[]" ]; then
+            echo "No languages to format"
+          fi
+
+          # Use -c flag with jq to get compact output without newlines
+          echo "languages=$LANGUAGES" >> $GITHUB_OUTPUT
+          echo "Languages to format: $LANGUAGES"
+
+  format-code:
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.languages != '[]'
+    outputs:
+      changes_detected: ${{ steps.check-all-changes.outputs.changes_detected }}
+      python_formatted: ${{ steps.python-format.outputs.python_formatted }}
+      python_format_success: ${{ steps.python-format.outputs.format_success }}
+      python_changes: ${{ steps.python-format.outputs.python_changes }}
+      shell_formatted: ${{ steps.shell-format.outputs.shell_formatted }}
+      shell_format_success: ${{ steps.shell-format.outputs.format_success }}
+      shell_changes: ${{ steps.shell-format.outputs.shell_changes }}
+      yaml_formatted: ${{ steps.yaml-format.outputs.yaml_formatted }}
+      yaml_format_success: ${{ steps.yaml-format.outputs.format_success }}
+      yaml_changes: ${{ steps.yaml-format.outputs.yaml_changes }}
+      python_log_tail: ${{ steps.set-log-outputs.outputs.python_log_tail }}
+      shell_log_tail: ${{ steps.set-log-outputs.outputs.shell_log_tail }}
+      yaml_log_tail: ${{ steps.set-log-outputs.outputs.yaml_log_tail }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+          fetch-depth: 0
+          # Use the PAT for git credentials so that pushes trigger CI workflows
+          token: ${{ secrets.ORG_FORMAT_CI_PUSHER }}
+
+      - name: Process ignore patterns
+        id: ignore_patterns
+        run: |
+          # Convert space-separated patterns to different formatters compatible formats
+          if [ -n "${{ inputs.ignore_patterns }}" ]; then
+            echo "input_patterns=${{ inputs.ignore_patterns }}" >> $GITHUB_ENV
+            
+            # For autoflake (comma-separated)
+            AUTOFLAKE_EXCLUDE=$(echo "${{ inputs.ignore_patterns }}" | tr ' ' ',')
+            echo "autoflake_exclude=$AUTOFLAKE_EXCLUDE" >> $GITHUB_ENV
+            
+            # For black (needs regex pattern with |)
+            # Convert glob patterns to regex patterns and join with |
+            BLACK_EXCLUDE=""
+            for pattern in ${{ inputs.ignore_patterns }}; do
+              # Escape regex special characters and convert glob * to regex .*
+              pattern=$(echo "$pattern" | sed 's/\./\\./g; s/\*/.\*/g; s/\?/./g')
+              if [ -z "$BLACK_EXCLUDE" ]; then
+                BLACK_EXCLUDE="$pattern"
+              else
+                BLACK_EXCLUDE="$BLACK_EXCLUDE|$pattern"
+              fi
+            done
+            echo "black_exclude=$BLACK_EXCLUDE" >> $GITHUB_ENV
+            
+            # For shellcheck and shfmt, similar approach
+            SHELL_EXCLUDE="${{ inputs.ignore_patterns }}"
+            echo "shell_exclude=$SHELL_EXCLUDE" >> $GITHUB_ENV
+            
+            # For yamlfmt, similar approach
+            YAML_EXCLUDE="${{ inputs.ignore_patterns }}"
+            echo "yaml_exclude=$YAML_EXCLUDE" >> $GITHUB_ENV
+          else
+            echo "autoflake_exclude=" >> $GITHUB_ENV
+            echo "black_exclude=" >> $GITHUB_ENV
+            echo "shell_exclude=" >> $GITHUB_ENV
+            echo "yaml_exclude=" >> $GITHUB_ENV
+          fi
+
+      # Python setup and formatting
+      - name: Set up Python
+        if: contains(needs.prepare.outputs.languages, 'python')
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Python formatting tools
+        if: contains(needs.prepare.outputs.languages, 'python')
+        run: |
+          python -m pip install --upgrade pip
+          pip install autoflake black
+          echo "Setting up Python formatting with version ${{ inputs.python_version }}"
+
+      - name: Run Python formatting
+        if: contains(needs.prepare.outputs.languages, 'python')
+        id: python-format
+        run: |
+          echo "Running Python formatting..."
+          touch /tmp/python_formatting_output.log
+
+          set -o pipefail
+
+          # Run autoflake with ignore patterns if specified
+          if [ -n "${{ env.autoflake_exclude }}" ]; then
+            echo "Excluding paths for autoflake: ${{ env.autoflake_exclude }}"
+            autoflake --in-place --recursive --remove-unused-variables --remove-all-unused-imports --exclude "${{ env.autoflake_exclude }}" . 2>&1 | tee -a /tmp/python_formatting_output.log
+          else
+            autoflake --in-place --recursive --remove-unused-variables --remove-all-unused-imports . 2>&1 | tee -a /tmp/python_formatting_output.log
+          fi
+
+          AUTOFLAKE_EXIT=$?
+
+          # Run black with ignore patterns if specified
+          if [ -n "${{ env.black_exclude }}" ]; then
+            echo "Excluding regex pattern for black: ${{ env.black_exclude }}"
+            black --exclude "${{ env.black_exclude }}" . 2>&1 | tee -a /tmp/python_formatting_output.log
+          else
+            black . 2>&1 | tee -a /tmp/python_formatting_output.log
+          fi
+
+          BLACK_EXIT=$?
+
+          if [ $AUTOFLAKE_EXIT -ne 0 ] || [ $BLACK_EXIT -ne 0 ]; then
+            echo "::error::Python formatting failed"
+            echo "format_success=false" >> $GITHUB_OUTPUT
+            
+            if [ $AUTOFLAKE_EXIT -ne 0 ]; then
+              echo "autoflake_failed=true" >> $GITHUB_OUTPUT
+              echo "Autoflake failed with exit code $AUTOFLAKE_EXIT" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if [ $BLACK_EXIT -ne 0 ]; then
+              echo "black_failed=true" >> $GITHUB_OUTPUT
+              echo "Black failed with exit code $BLACK_EXIT" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "format_success=true" >> $GITHUB_OUTPUT
+            echo "Python formatting completed successfully"
+            echo "python_formatted=true" >> $GITHUB_OUTPUT
+          fi
+
+          # Check if there are any changes
+          if git diff --quiet; then
+            echo "No changes detected after Python formatting."
+            echo "python_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changes detected after Python formatting."
+            echo "python_changes=true" >> $GITHUB_OUTPUT
+            
+            # Configure git for Python commits
+            git config --local user.email "butler@golgix.com"
+            git config --local user.name "Butler"
+            
+            git add -A
+            git commit -m "Apply automatic Python code formatting"
+            echo "python_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+          # Save logs for potential PR comments
+          mkdir -p /tmp
+          cp /tmp/python_formatting_output.log /tmp/python_format_output.log
+          # Extract the last 50 lines of logs for the PR comment
+          tail -n 50 /tmp/python_formatting_output.log > /tmp/python_format_tail.log
+
+      # Shell script setup and formatting
+      - name: Set up ShellCheck and shfmt
+        if: contains(needs.prepare.outputs.languages, 'shell')
+        run: |
+          echo "Setting up shell script formatting tools..."
+
+          # Install ShellCheck
+          SHELLCHECK_VERSION=${{ inputs.shell_version }}
+          curl -sSL "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" -o shellcheck.tar.xz
+          tar -xf shellcheck.tar.xz
+          sudo cp "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
+          rm -rf shellcheck.tar.xz shellcheck-v${SHELLCHECK_VERSION}
+          shellcheck --version
+
+          # Install shfmt
+          SHFMT_VERSION=${{ inputs.shfmt_version }}
+          curl -sSL "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64" -o shfmt
+          chmod +x shfmt
+          sudo mv shfmt /usr/local/bin/
+          shfmt --version
+
+      - name: Run shell script formatting
+        if: contains(needs.prepare.outputs.languages, 'shell')
+        id: shell-format
+        run: |
+          echo "Running shell script formatting..."
+          touch /tmp/shell_formatting_output.log
+
+          # Find shell scripts with proper exclusion handling
+          if [ -n "${{ env.shell_exclude }}" ]; then
+            echo "Excluding paths for shell formatting: ${{ env.shell_exclude }}"
+
+            # Create exclude patterns file for grep
+            EXCLUDE_PATTERNS=""
+            for pattern in ${{ env.shell_exclude }}; do
+              # Convert glob patterns to regex
+              # Replace ** with .* for grep regex
+              regex_pattern=$(echo "$pattern" | sed 's/\*\*/.*/' | sed 's/\*/[^\/]*/' | sed 's/\./\\./')
+              EXCLUDE_PATTERNS="${EXCLUDE_PATTERNS}${regex_pattern}|"
+            done
+            # Remove trailing pipe
+            EXCLUDE_PATTERNS=${EXCLUDE_PATTERNS%|}
+
+            echo "Using exclude regex pattern: $EXCLUDE_PATTERNS"
+
+            # Find all shell scripts and filter out excluded paths
+            SHELL_SCRIPTS=$(find . -type f -name "*.sh" -o -name "*.bash" | grep -v -E "$EXCLUDE_PATTERNS" || echo "")
+          else
+            # Find all shell scripts if no exclusions
+            SHELL_SCRIPTS=$(find . -type f -name "*.sh" -o -name "*.bash")
+          fi
+
+          # Handle empty results
+          if [ -z "$SHELL_SCRIPTS" ]; then
+            echo "No shell scripts found for formatting."
+            echo "format_success=true" >> $GITHUB_OUTPUT
+            echo "shell_formatted=false" >> $GITHUB_OUTPUT
+            echo "shell_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Debug - Show found scripts
+          echo "Found the following shell scripts for formatting:"
+          echo "$SHELL_SCRIPTS"
+
+          # Create a list file of shell scripts for easy processing
+          echo "$SHELL_SCRIPTS" > /tmp/shell_scripts.txt
+
+          # Run ShellCheck
+          echo "Running ShellCheck..." | tee -a /tmp/shell_formatting_output.log
+          SHELLCHECK_EXIT=0
+          while IFS= read -r script; do
+            echo "Checking $script" | tee -a /tmp/shell_formatting_output.log
+            if [ -f "$script" ] && [ -r "$script" ]; then
+              shellcheck -x "$script" >> /tmp/shell_formatting_output.log 2>&1 || SHELLCHECK_EXIT=$?
+            else
+              echo "Warning: Cannot access $script - skipping" | tee -a /tmp/shell_formatting_output.log
+            fi
+          done < /tmp/shell_scripts.txt
+
+          # Run shfmt
+          echo "Running shfmt..." | tee -a /tmp/shell_formatting_output.log
+          SHFMT_EXIT=0
+          while IFS= read -r script; do
+            echo "Formatting $script" | tee -a /tmp/shell_formatting_output.log
+            if [ -f "$script" ] && [ -w "$script" ]; then
+              # Apply formatting with 2-space indentation and simplification
+              shfmt -i 2 -s -w "$script" >> /tmp/shell_formatting_output.log 2>&1 || SHFMT_EXIT=$?
+            else
+              echo "Warning: Cannot access $script for writing - skipping" | tee -a /tmp/shell_formatting_output.log
+            fi
+          done < /tmp/shell_scripts.txt
+
+          #! INFO: We'll consider it a success even if some scripts couldn't be formatted - we'll just format what we can.
+          echo "format_success=true" >> $GITHUB_OUTPUT
+          echo "Shell script formatting completed with exit codes: ShellCheck=$SHELLCHECK_EXIT, shfmt=$SHFMT_EXIT"
+          echo "shell_formatted=true" >> $GITHUB_OUTPUT
+
+          # Check if there are any changes
+          if git diff --quiet; then
+            echo "No changes detected after shell script formatting."
+            echo "shell_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changes detected after shell script formatting."
+            echo "shell_changes=true" >> $GITHUB_OUTPUT
+            
+            # Configure git for shell commits (if not done already)
+            git config --local user.email "butler@golgix.com"
+            git config --local user.name "Butler"
+            
+            # Commit shell formatting changes
+            # Check if we have anything to stage
+            if ! git diff --quiet; then
+              git add -A
+              git commit -m "Apply automatic shell script formatting"
+              echo "shell_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+            else
+              echo "No changes to commit after git add"
+              echo "shell_changes=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          # Save logs for potential PR comments
+          cp /tmp/shell_formatting_output.log /tmp/shell_format_output.log
+          # Extract the last 50 lines of logs for the PR comment
+          tail -n 50 /tmp/shell_formatting_output.log > /tmp/shell_format_tail.log
+
+      - name: Set up yamlfmt
+        if: contains(needs.prepare.outputs.languages, 'yaml')
+        run: |
+          echo "Setting up yamlfmt..."
+          YAMLFMT_VERSION=${{ inputs.yamlfmt_version }}
+          curl -sSL "https://github.com/google/yamlfmt/releases/download/v${YAMLFMT_VERSION}/yamlfmt_${YAMLFMT_VERSION}_$(uname -s)_$(uname -m).tar.gz" -o yamlfmt.tar.gz
+          tar -xzf yamlfmt.tar.gz yamlfmt
+          chmod +x yamlfmt
+          sudo mv yamlfmt /usr/local/bin/
+          rm yamlfmt.tar.gz
+          yamlfmt --version
+
+      - name: Run YAML formatting
+        if: contains(needs.prepare.outputs.languages, 'yaml')
+        id: yaml-format
+        run: |
+          echo "Running YAML formatting..."
+          touch /tmp/yaml_formatting_output.log
+          # Find YAML files with proper exclusion handling
+          if [ -n "${{ env.yaml_exclude }}" ]; then
+            echo "Excluding paths for YAML formatting: ${{ env.yaml_exclude }} and .github/workflows/*.yml"
+            for pattern in ${{ env.yaml_exclude }}; do
+              # Replace ** with .* for grep regex
+              regex_pattern=$(echo "$pattern" | sed 's/\*\*/.*/' | sed 's/\*/[^\/]*/' | sed 's/\./\\./')
+              EXCLUDE_PATTERNS="${EXCLUDE_PATTERNS}${regex_pattern}|"
+            done
+            # Remove trailing pipe
+            EXCLUDE_PATTERNS=${EXCLUDE_PATTERNS%|}
+            YAML_FILES=$(find . -type f \( -name "*.yml" -o -name "*.yaml" \) | grep -v -E "$EXCLUDE_PATTERNS" | grep -v -E ".github/workflows/.*\.yml" || echo "")
+          else
+            YAML_FILES=$(find . -type f \( -name "*.yml" -o -name "*.yaml" \) | grep -v -E ".github/workflows/.*\.yml" || echo "")
+          fi
+          if [ -z "$YAML_FILES" ]; then
+            echo "No YAML files found for formatting."
+            echo "format_success=true" >> $GITHUB_OUTPUT
+            echo "yaml_formatted=false" >> $GITHUB_OUTPUT
+            echo "yaml_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found the following YAML files for formatting:"
+          echo "$YAML_FILES"
+          echo "$YAML_FILES" > /tmp/yaml_files.txt
+          YAMLFMT_EXIT=0
+          # Build yamlfmt command
+          YAMLFMT_CMD="yamlfmt "
+          for file in $YAML_FILES; do
+            YAMLFMT_CMD+="$file "
+          done
+          echo "Running: $YAMLFMT_CMD" | tee -a /tmp/yaml_formatting_output.log
+          eval $YAMLFMT_CMD >> /tmp/yaml_formatting_output.log 2>&1 || YAMLFMT_EXIT=$?
+          if [ $YAMLFMT_EXIT -ne 0 ]; then
+            echo "::error::YAML formatting failed with exit code $YAMLFMT_EXIT"
+            echo "format_success=false" >> $GITHUB_OUTPUT
+          else
+            echo "format_success=true" >> $GITHUB_OUTPUT
+            echo "yaml_formatted=true" >> $GITHUB_OUTPUT
+          fi
+          # Check if there are any changes
+          if git diff --quiet; then
+            echo "No changes detected after YAML formatting."
+            echo "yaml_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changes detected after YAML formatting."
+            echo "yaml_changes=true" >> $GITHUB_OUTPUT
+            git config --local user.email "butler@golgix.com"
+            git config --local user.name "Butler"
+            git add -A
+            git commit -m "Apply automatic YAML code formatting"
+            echo "yaml_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          fi
+          cp /tmp/yaml_formatting_output.log /tmp/yaml_format_output.log
+          tail -n 50 /tmp/yaml_formatting_output.log > /tmp/yaml_format_tail.log
+
+      - name: Check for any changes across all languages
+        id: check-all-changes
+        run: |
+          # Check if any language reported changes
+          CHANGES_DETECTED=false
+
+          # Check Python changes if Python formatting was enabled
+          if [[ "${{ contains(needs.prepare.outputs.languages, 'python') }}" == "true" && "${{ steps.python-format.outputs.python_changes }}" == "true" ]]; then
+            echo "Python formatting changes detected."
+            CHANGES_DETECTED=true
+          fi
+
+          # Check Shell changes if Shell formatting was enabled
+          if [[ "${{ contains(needs.prepare.outputs.languages, 'shell') }}" == "true" && "${{ steps.shell-format.outputs.shell_changes }}" == "true" ]]; then
+            echo "Shell script formatting changes detected."
+            CHANGES_DETECTED=true
+          fi
+
+          # Check YAML changes if YAML formatting was enabled
+          if [[ "${{ contains(needs.prepare.outputs.languages, 'yaml') }}" == "true" && "${{ steps.yaml-format.outputs.yaml_changes }}" == "true" ]]; then
+            echo "YAML formatting changes detected."
+            CHANGES_DETECTED=true
+          fi
+
+          #! INFO: Add checks for other languages here in the future
+
+          if [ "$CHANGES_DETECTED" == "true" ]; then
+            echo "Changes detected after formatting one or more languages."
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes detected after formatting all languages."
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push all formatting changes (Pull request event)
+        if: steps.check-all-changes.outputs.changes_detected == 'true' && github.event_name == 'pull_request'
+        run: |
+          # Pull latest changes to ensure we're up-to-date
+          git pull origin ${{ github.event.pull_request.head.ref }} --rebase
+
+          # Push all formatting changes at once
+          # The PAT from actions/checkout token is already configured as git credentials
+          # Try to push a few times with exponential backoff to handle race conditions
+          MAX_ATTEMPTS=3
+          attempt=1
+          pushed=false
+
+          while [ $attempt -le $MAX_ATTEMPTS ] && [ "$pushed" = "false" ]; do
+            echo "Push attempt $attempt of $MAX_ATTEMPTS"
+            if git push; then
+              pushed=true
+              echo "Successfully pushed all formatting changes"
+            else
+              echo "Push failed, retrying in $((2**attempt)) seconds"
+              sleep $((2**attempt))
+              # Pull latest changes before retrying
+              git pull origin ${{ github.event.pull_request.head.ref }} --rebase
+              attempt=$((attempt+1))
+            fi
+          done
+
+          if [ "$pushed" = "false" ]; then
+            echo "::warning::Failed to push formatting changes after $MAX_ATTEMPTS attempts"
+            exit 1
+          fi
+
+      - name: Create PR for all formatting changes (Push event)
+        if: steps.check-all-changes.outputs.changes_detected == 'true' && github.event_name == 'push'
+        uses: peter-evans/create-pull-request@v7.0.8
+        with:
+          token: ${{ secrets.ORG_FORMAT_CI_PUSHER }}
+          commit-message: "Apply automatic code formatting"
+          title: "Automated code formatting"
+          body: |
+            This PR was automatically created by the Butler.
+
+            Changes:
+            ${{ contains(needs.prepare.outputs.languages, 'python') && steps.python-format.outputs.python_changes == 'true' && '- Applied automatic code formatting for Python' || '' }}
+            ${{ contains(needs.prepare.outputs.languages, 'shell') && steps.shell-format.outputs.shell_changes == 'true' && '- Applied automatic code formatting for Shell scripts' || '' }}
+            ${{ contains(needs.prepare.outputs.languages, 'yaml') && steps.yaml-format.outputs.yaml_changes == 'true' && '- Applied automatic code formatting for YAML files' || '' }}
+
+            Formatting tools used:
+            ${{ contains(needs.prepare.outputs.languages, 'python') && steps.python-format.outputs.python_changes == 'true' && '- autoflake: Remove unused imports and variables\n- black: Code style formatting' || '' }}
+            ${{ contains(needs.prepare.outputs.languages, 'shell') && steps.shell-format.outputs.shell_changes == 'true' && '- shellcheck: Shell script static analysis\n- shfmt: Shell script formatter' || '' }}
+            ${{ contains(needs.prepare.outputs.languages, 'yaml') && steps.yaml-format.outputs.yaml_changes == 'true' && '- yamlfmt: YAML file formatter' || '' }}
+
+            Ignore patterns: ${{ inputs.ignore_patterns }}
+          branch: sync/auto-format-${{ github.ref_name }}
+          base: ${{ github.ref_name }}
+          delete-branch: true
+
+      - name: Set log tails as outputs
+        id: set-log-outputs
+        run: |
+          if [ -f /tmp/python_format_tail.log ]; then
+            echo "python_log_tail<<EOF" >> $GITHUB_OUTPUT
+            cat /tmp/python_format_tail.log >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          if [ -f /tmp/shell_format_tail.log ]; then
+            echo "shell_log_tail<<EOF" >> $GITHUB_OUTPUT
+            cat /tmp/shell_format_tail.log >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          if [ -f /tmp/yaml_format_tail.log ]; then
+            echo "yaml_log_tail<<EOF" >> $GITHUB_OUTPUT
+            cat /tmp/yaml_format_tail.log >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+  collect-results:
+    needs: [prepare, format-code]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check formatting status
+        id: check-status
+        run: |
+          # First, check if prepare step failed
+          if [[ "${{ needs.prepare.result }}" == "failure" ]]; then
+            echo "::error::Prepare job failed, cannot proceed with formatting"
+            echo "Code formatting failed at preparation step" >> $GITHUB_STEP_SUMMARY
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "reason=prepare_failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Then check if any format-code jobs failed or were cancelled
+          if [[ "${{ needs.format-code.result }}" == "failure" || "${{ needs.format-code.result }}" == "cancelled" ]]; then
+            echo "::error::Code formatting task failed"
+            echo "Code formatting failed" >> $GITHUB_STEP_SUMMARY
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "reason=format_failed" >> $GITHUB_OUTPUT
+            exit 0
+          elif [[ "${{ needs.format-code.result }}" == "skipped" || "${{ needs.prepare.outputs.languages }}" == "[]" ]]; then
+            echo "No languages were formatted - no formatting configuration enabled"
+            echo "No languages were formatted - configuration check your workflow inputs" >> $GITHUB_STEP_SUMMARY
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "reason=no_languages" >> $GITHUB_OUTPUT
+          else
+            echo "All code formatting tasks completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "reason=all_passed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate formatting report
+        run: |
+          # Write the status table to a temp file only, and use it later in generating the summary and comment
+          echo "| Language | Status | Details |" > /tmp/format_status_table.md
+          echo "| --- | --- | --- |" >> /tmp/format_status_table.md
+
+          LANGUAGES='${{ needs.prepare.outputs.languages }}'
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          languages_list=$(echo $LANGUAGES | jq -r '.[]')
+
+          if [[ -z "$languages_list" ]]; then
+            echo "| None | Skipped | No language formatting was enabled |" >> /tmp/format_status_table.md
+          else
+            echo "$languages_list" | while read -r lang; do
+              if [[ "$lang" == "python" ]]; then
+                format_success="${{ needs.format-code.outputs.python_format_success }}"
+                if [[ "$format_success" == "true" ]]; then
+                  python_changes="${{ needs.format-code.outputs.python_changes }}"
+                  if [[ "$python_changes" == "true" ]]; then
+                    echo "| Python | ✅ Success | Changes applied |" >> /tmp/format_status_table.md
+                  else
+                    echo "| Python | ✅ Success | No changes needed |" >> /tmp/format_status_table.md
+                  fi
+                else
+                  echo "| Python | ❌ Failed | [See job logs]($RUN_URL) |" >> /tmp/format_status_table.md
+                fi
+              fi
+              if [[ "$lang" == "shell" ]]; then
+                format_success="${{ needs.format-code.outputs.shell_format_success }}"
+                if [[ "$format_success" == "true" ]]; then
+                  shell_changes="${{ needs.format-code.outputs.shell_changes }}"
+                  if [[ "$shell_changes" == "true" ]]; then
+                    echo "| Shell | ✅ Success | Changes applied |" >> /tmp/format_status_table.md
+                  else
+                    echo "| Shell | ✅ Success | No changes needed |" >> /tmp/format_status_table.md
+                  fi
+                else
+                  echo "| Shell | ❌ Failed | [See job logs]($RUN_URL) |" >> /tmp/format_status_table.md
+                fi
+              fi
+              if [[ "$lang" == "yaml" ]]; then
+                format_success="${{ needs.format-code.outputs.yaml_format_success }}"
+                if [[ "$format_success" == "true" ]]; then
+                  yaml_changes="${{ needs.format-code.outputs.yaml_changes }}"
+                  if [[ "$yaml_changes" == "true" ]]; then
+                    echo "| YAML | ✅ Success | Changes applied |" >> /tmp/format_status_table.md
+                  else
+                    echo "| YAML | ✅ Success | No changes needed |" >> /tmp/format_status_table.md
+                  fi
+                else
+                  echo "| YAML | ❌ Failed | [See job logs]($RUN_URL) |" >> /tmp/format_status_table.md
+                fi
+              fi
+              #! INFO: Add other languages here in the future
+            done
+          fi
+
+          # Append the table to the summary at the end
+          echo "## Code Formatting Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat /tmp/format_status_table.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "For detailed logs, see the [workflow run]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR - Failure
+        if: github.event_name == 'pull_request' && steps.check-status.outputs.status == 'failure'
+        uses: actions/github-script@v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            let failureReason = '';
+            let logContent = '';
+            let statusTable = '';
+            try { statusTable = fs.readFileSync('/tmp/format_status_table.md', 'utf8'); } catch (e) { statusTable = '*Status table unavailable*'; }
+            try {
+              const languagesRaw = '${{ needs.prepare.outputs.languages }}';
+              const languages = languagesRaw ? JSON.parse(languagesRaw) : [];
+              if (languages.includes('python')) {
+                const logTail = `${{ needs.format-code.outputs.python_log_tail }}`;
+                if (logTail && logTail.trim()) {
+                  logContent += '\n### Python Formatting\n\n';
+                  logContent += "```\n" + logTail + "\n```\n";
+                }
+              }
+              if (languages.includes('shell')) {
+                const logTail = `${{ needs.format-code.outputs.shell_log_tail }}`;
+                if (logTail && logTail.trim()) {
+                  logContent += '\n### Shell Script Formatting\n\n';
+                  logContent += "```\n" + logTail + "\n```\n";
+                }
+              }
+              if (languages.includes('yaml')) {
+                const logTail = `${{ needs.format-code.outputs.yaml_log_tail }}`;
+                if (logTail && logTail.trim()) {
+                  logContent += '\n### YAML Formatting\n\n';
+                  logContent += "```\n" + logTail + "\n```\n";
+                }
+              }
+              //! INFO: Add other languages here in the future
+            } catch (error) { console.error('Error reading logs:', error); logContent = 'Failed to read formatting logs.'; }
+            switch('${{ steps.check-status.outputs.reason }}') {
+              case 'prepare_failed': failureReason = 'Formatting preparation failed. Check workflow configuration.'; break;
+              case 'format_failed': failureReason = 'One or more critical code formatters encountered errors.'; break;
+              default: failureReason = 'Code formatting check failed.';
+            }
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const body = [
+              '## ❌ Code Formatting Failed',
+              '',
+              `**Error:** ${failureReason}`,
+              '',
+              '### Status Table',
+              '',
+              statusTable,
+              '',
+              logContent ? `<details>\n<summary>Formatting Logs</summary>\n\n${logContent}\n</details>` : '',
+              '',
+              `[View full formatting logs](${runUrl})`,
+              '',
+              '### Troubleshooting Tips',
+              '',
+              '1. Check for syntax errors in your code',
+              '2. Verify the ignore patterns are correctly formatted',
+              '3. Try running the formatter locally to debug issues',
+            ].join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+      - name: Comment on PR - Success
+        if: github.event_name == 'pull_request' && steps.check-status.outputs.status == 'success'
+        uses: actions/github-script@v7.0.1
+        env:
+          PYTHON_LOG_TAIL: ${{ needs.format-code.outputs.python_log_tail }}
+          SHELL_LOG_TAIL: ${{ needs.format-code.outputs.shell_log_tail }}
+          YAML_LOG_TAIL: ${{ needs.format-code.outputs.yaml_log_tail }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            let changedLanguages = [];
+            let errorLogs = '';
+            const languagesRaw = '${{ needs.prepare.outputs.languages }}';
+            const formattedLanguages = languagesRaw ? JSON.parse(languagesRaw) : [];
+            if (formattedLanguages.includes('python')) {
+              if ('${{ needs.format-code.outputs.python_changes }}' === 'true') {
+                changedLanguages.push('Python');
+              }
+              if ('${{ needs.format-code.outputs.python_format_success }}' === 'false') {
+                const logTail = process.env.PYTHON_LOG_TAIL;
+                if (logTail && logTail.trim()) {
+                  errorLogs += '**Python formatting failed.**\n\n';
+                  errorLogs += "```\n" + logTail + "\n```\n";
+                }
+              }
+            }
+            if (formattedLanguages.includes('shell')) {
+              if ('${{ needs.format-code.outputs.shell_changes }}' === 'true') {
+                changedLanguages.push('Shell');
+              }
+              if ('${{ needs.format-code.outputs.shell_format_success }}' === 'false') {
+                const logTail = process.env.SHELL_LOG_TAIL;
+                if (logTail && logTail.trim()) {
+                  errorLogs += '**Shell formatting failed.**\n\n';
+                  errorLogs += "```\n" + logTail + "\n```\n";
+                }
+              }
+            }
+            if (formattedLanguages.includes('yaml')) {
+              if ('${{ needs.format-code.outputs.yaml_changes }}' === 'true') {
+                changedLanguages.push('YAML');
+              }
+              if ('${{ needs.format-code.outputs.yaml_format_success }}' === 'false') {
+                const logTail = process.env.YAML_LOG_TAIL;
+                if (logTail && logTail.trim()) {
+                  errorLogs += '**YAML formatting failed.**\n\n';
+                  errorLogs += "```\n" + logTail + "\n```\n";
+                }
+              }
+            }
+            //! INFO: Add other languages here in the future
+            const changesDetected = changedLanguages.length > 0;
+            const changedLanguagesList = changedLanguages.join(', ');
+            let statusTable = '';
+            try { statusTable = fs.readFileSync('/tmp/format_status_table.md', 'utf8'); } catch (e) { statusTable = '*Status table unavailable*'; }
+            const body = [
+              '## ✅ Code Formatting Succeeded',
+              '',
+              'All critical code formatting checks passed successfully. Check the status table below for details.',
+              '',
+              '### Status Table',
+              '',
+              statusTable,
+              '',
+              changesDetected ? `**Changes were applied and committed for:** ${changedLanguagesList}` : '**No changes were needed.**',
+              '',
+              `[View details](${runUrl})`,
+              '',
+              errorLogs ? `<details>\n<summary>Formatting Logs</summary>\n\n${errorLogs}\n</details>` : '',
+              '',
+            ].join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+      - name: Exit with correct status
+        if: always()
+        run: |
+          if [ "${{ steps.check-status.outputs.status }}" == "failure" ]; then
+            echo "::error::Code formatting failed (job or step failure)"
+            exit 1
+          fi
+          # Also fail if any language failed (partial_failure)
+          if [ "$partial_failure" == "true" ]; then
+            echo "::error::One or more languages failed formatting."
+            exit 1
+          fi
