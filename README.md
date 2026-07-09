@@ -24,3 +24,4 @@ This minimal repository is designed to independently validate the fix for GL-370
    ```
 3. Commit and push the changes.
 4. The formatting job will evaluate `languages == "[]"` and naturally skip execution. The `check-status` job will catch the skipped status and properly exit. The JSON parse crash will not occur.
+<img width="1024" height="500" alt="Frame 1" src="https://github.com/user-attachments/assets/94737a2a-6302-4a1d-b6e0-430f587b0de2" />
