@@ -27,3 +27,4 @@ This minimal repository is designed to independently validate the fix for GL-370
 <img width="1024" height="500" alt="Frame 1" src="https://github.com/user-attachments/assets/94737a2a-6302-4a1d-b6e0-430f587b0de2" />
 <img width="512" height="512" alt="icon" src="https://github.com/user-attachments/assets/2d8b05e5-480a-490d-921f-551d21a37aff" />
 <img width="1024" height="500" alt="First" src="https://github.com/user-attachments/assets/000711b0-f016-45bc-8b99-da0739f137ea" />
+<img width="1024" height="500" alt="Frame 1 (1)" src="https://github.com/user-attachments/assets/93b5460f-84e9-4a2d-a5c7-8cdd26d7b554" />
